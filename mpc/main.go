@@ -3,165 +3,153 @@ package main
 import (
 	"bufio"
 	"fmt"
-	"io"
+	"log"
 	"net"
 	"os"
 	"os/exec"
-	"sort"
 	"strconv"
+	"strings"
+	"sync"
 )
 
-func party_address(party int) string {
-	return "127.0.0.1:" + strconv.Itoa(party_port(party))
-}
+const ENV_PLAYER_ADDRESSES = "PLAYER_ADDRESSES"
 
-func party_port(party int) int {
-	return party + 7000
-}
-
-type Connection struct {
-	conn  *bufio.ReadWriter
+type ConnectionIdentify struct {
 	other int
+	conn  Connection
 }
 
-func (c *Connection) Write(s []byte) error {
-	_, err := c.conn.Write(s)
+type ConnectionPair struct {
+	send *Connection
+	recv *Connection
+}
+
+type Networker struct {
+	me      int
+	players int
+	conns   []ConnectionPair
+	ready   sync.WaitGroup
+}
+
+var ADDRESSES []*net.TCPAddr
+
+/// load player addresses
+func init() {
+	var path string
+	for _, e := range os.Environ() {
+		pair := strings.SplitN(e, "=", 2)
+		if pair[0] == ENV_PLAYER_ADDRESSES {
+			path = pair[1]
+		}
+	}
+
+	if path == "" {
+		log.Println("No peer addresses loaded")
+		return
+	}
+
+	file, err := os.Open(path)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		addr, err := net.ResolveTCPAddr("tcp", scanner.Text())
+		if err != nil {
+			log.Fatal(err)
+		}
+		ADDRESSES = append(ADDRESSES, addr)
+		fmt.Println("Peer address:", addr)
+	}
+}
+
+func (n *Networker) Connect(player int) error {
+	if player >= len(ADDRESSES) {
+		log.Fatal("Player addresses not specified", player)
+	}
+
+	// create TCP connection
+	conn, err := net.DialTCP("tcp", nil, ADDRESSES[player])
 	if err != nil {
 		return err
 	}
-	return c.conn.Flush()
+
+	// wrap in Gob
+	if n.conns[player].send != nil {
+		log.Fatal("Double connection to:", player)
+	}
+	n.conns[player].send = NewConnection(conn)
+	n.ready.Done()
+
+	// tell the other side who we are
+	return n.conns[player].send.Encode(n.me)
 }
 
-func (c *Connection) Read(dst []byte) error {
-	_, err := io.ReadFull(c.conn, dst)
-	return err
-}
-
-func MeConnection(me int) Connection {
-	return Connection{
-		conn:  nil,
-		other: me,
-	}
-}
-
-func NewConnection(conn net.Conn, me int) (Connection, error) {
-	c := Connection{
-		/*
-			dec: cbor.NewDecoder(conn),
-			enc: cbor.NewEncoder(conn),
-				dec:   json.NewDecoder(conn),
-				enc:   json.NewEncoder(conn),
-		*/
-		conn: bufio.NewReadWriter(
-			bufio.NewReader(conn),
-			bufio.NewWriter(conn),
-		),
-		other: 0,
-	}
-
-	// identity peers
-	if err := c.WriteInt(me); err != nil {
-		return c, err
-	}
-
-	other, err := c.ReadInt()
-	if err != nil {
-		return c, err
-	}
-	c.other = other
-	return c, nil
-}
-
-func MakeConnections(batches, parties, me int) [][]Connection {
-	addr := ":" + strconv.Itoa(party_port(me))
-	fmt.Println("Making connections:", addr)
-
-	conns := make(chan net.Conn)
-
-	addr_me, err := net.ResolveTCPAddr("tcp", addr)
-	if err != nil {
-		panic(err)
-	}
-
-	// listen for connections
-	go func() {
-		ls, err := net.ListenTCP("tcp", addr_me)
-		if err != nil {
-			panic(err)
-		}
-		for {
-			conn, err := ls.AcceptTCP()
-			conn.SetReadBuffer(TCP_BUFFER)
-			if err != nil {
-				panic(err)
-			}
-			conns <- conn
-		}
-	}()
-
-	// create TCP connections to higher parties
-	go func() {
-		for batch := 0; batch < batches; batch++ {
-			for party := 0; party < parties; party++ {
-				if party > me {
-					// I must connect
-					addr, err := net.ResolveTCPAddr("tcp", party_address(party))
-					if err != nil {
-						panic(err)
-					}
-					conn, err := net.DialTCP("tcp", nil, addr)
-					if err != nil {
-						panic(err)
-					}
-					conn.SetReadBuffer(TCP_BUFFER)
-					conns <- conn
-				}
-			}
-		}
-	}()
-
-	// get parties - 1 connections and identity
-	num_conns := parties * batches
-
-	con := make([]Connection, 0, num_conns)
-	for batch := 0; batch < batches; batch++ {
-		for i := 0; i < parties; i++ {
-			if i == 0 {
-				con = append(con, MeConnection(me))
-			} else {
-				c := <-conns
-				fmt.Println("Connection:", i)
-				g, err := NewConnection(c, me)
-				if err != nil {
-					panic(err)
-				}
-				con = append(con, g)
-			}
-		}
-	}
-
-	// sort connections after id
-	sort.Slice(con, func(i, j int) bool {
-		return con[i].other < con[j].other
-	})
-
-	// split into batches
-	bcon := make([][]Connection, batches)
-	next := 0
-	for i := 0; i < parties; i++ {
-		for batch := 0; batch < batches; batch++ {
-			bcon[batch] = append(bcon[batch], con[next])
-			next += 1
-		}
+func NewNetworker(players, me int) Networker {
+	if me >= len(ADDRESSES) {
+		log.Fatal("Player addresses not specified", me)
 	}
 
 	//
-	fmt.Println("Connections:", bcon)
-	return bcon
+	var n Networker
+	n.me = me
+	n.players = players
+	n.conns = make([]ConnectionPair, players)
+	n.ready.Add(2 * (players - 1))
+
+	// accept connections indefintely
+	go func(n *Networker) {
+		ls, err := net.ListenTCP("tcp", ADDRESSES[me])
+		if err != nil {
+			panic(err)
+		}
+
+		for {
+			// accept new connection
+			conn, err := ls.AcceptTCP()
+			if err != nil {
+				panic(err)
+			}
+			c := NewConnection(conn)
+
+			// identify counter party
+			var them int
+			if err := c.Decode(&them); err != nil {
+				panic(err)
+			}
+
+			// add connection
+			if n.conns[them].recv != nil {
+				log.Fatal("Double connection from:", them)
+			}
+			n.conns[them].recv = c
+			n.ready.Done()
+
+			// connect back to higher player number (he is now online, we know)
+			if them > me {
+				if err := n.Connect(them); err != nil {
+					log.Fatalln("Failed to connect to", them, err)
+				}
+			}
+		}
+	}(&n)
+
+	// connect to lower players
+	for them := 0; them < me; them++ {
+		if err := n.Connect(them); err != nil {
+			log.Fatalln("Failed to connect to", them, err)
+		}
+	}
+
+	// wait for 2 connections from each player
+	n.ready.Wait()
+	return n
 }
 
 func main() {
-	fmt.Println("starting", os.Args[1:])
+	log.Println("Setting up:", os.Args[1:])
 
 	// find number of players
 	parties := func() int {
@@ -177,6 +165,10 @@ func main() {
 		panic("Parties not specified")
 	}()
 
+	if parties > len(ADDRESSES) {
+		log.Fatal("Too few player addresses specified")
+	}
+
 	// find which player
 	me := func() int {
 		for i := 1; i < len(os.Args); i++ {
@@ -191,45 +183,53 @@ func main() {
 		panic("Player not specified")
 	}()
 
-	fmt.Println("Player:", me)
-	fmt.Println("Parties:", parties)
-
-	// pass arguments to MP-SPDZ command
-	cmd := exec.Command(os.Args[1], os.Args[2:]...)
-
-	// get stdout
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		fmt.Println("failed to open stdout:", err)
-		panic(err)
-	}
-
-	// get stdin
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		fmt.Println("failed to open in:", err)
-		panic(err)
-
-	}
+	log.Println("Player:", me)
+	log.Println("Parties:", parties)
 
 	// start MP-SPDZ
-	if err := cmd.Start(); err != nil {
-		fmt.Println("failed to start:", err)
-		panic(err)
-	}
+	mpc, cmd := func() (*MPC, *exec.Cmd) {
+		// pass arguments to MP-SPDZ command
+		cmd := exec.Command(os.Args[1], os.Args[2:]...)
 
-	// wrap in MPC abstraction
-	mpc := NewMPC(stdout, stdin)
-	fmt.Println(mpc)
+		// get stdout
+		stdout, err := cmd.StdoutPipe()
+		if err != nil {
+			fmt.Println("failed to open stdout:", err)
+			panic(err)
+		}
 
-	// make TCP connections
-	bcon := MakeConnections(2, parties, me)
+		// get stdin
+		stdin, err := cmd.StdinPipe()
+		if err != nil {
+			fmt.Println("failed to open in:", err)
+			panic(err)
 
-	oip, err := NewOIP(bcon, me, parties)
+		}
+
+		// start MP-SPDZ instance
+		if err := cmd.Start(); err != nil {
+			fmt.Println("failed to start:", err)
+			panic(err)
+		}
+
+		// wrap in MPC abstraction
+		return NewMPC(stdout, stdin), cmd
+	}()
+
+	// block and wait for connections
+	networker := NewNetworker(parties, me)
+
+	// setup OIP
+	oip, err := NewOIP(
+		networker.conns,
+		me,
+		parties,
+	)
 	if err != nil {
 		panic(err)
 	}
 
+	// load inputs for party
 	inputs := func() []uint64 {
 		if me == 1 {
 			inputs := make([]uint64, 100)
@@ -240,16 +240,13 @@ func main() {
 		return random(100)
 	}()
 
-	// setup OIP protocol
+	// run MPC circuit
+	log.Println("Start evaluation...")
 	output := run(me, inputs, mpc, oip)
 
+	// wait for MP-SPDZ to finish
 	if err := cmd.Wait(); err != nil {
-		fmt.Println("error", err)
 		panic(err)
 	}
-
-	fmt.Println("Output:", output)
-
-	// os.Args[0]
-	return
+	log.Println("Output:", output)
 }

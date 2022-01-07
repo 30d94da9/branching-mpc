@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 CONST_ADD = 0
 CONST_MUL = 1
 
@@ -422,16 +424,31 @@ if __name__ == '__main__':
 
     import sys
 
-    circuit = sys.argv[1] if len(sys.argv) > 1 else None
-    runner  = sys.argv[2] if len(sys.argv) > 2 else None
+    args = iter(sys.argv[1:])
 
-    length = int(sys.argv[3])
-    branches = int(sys.argv[4])
-    parties = int(sys.argv[5])
+    try:
+        length = int(next(args))
+        branches = int(next(args))
+        parties = int(next(args))
+    except (StopIteration, ValueError):
+        print('%s length branches parties [circuit] [runner]' % sys.argv[0])
+        exit(-1)
 
-    print('Length:', length)
-    print('Branches:', branches)
-    print('Parties:', parties)
+    def opt():
+        global args
+        try:
+            return next(args)
+        except StopIteration:
+            return None
+
+    circuit = opt()
+    runner = opt()
+
+    print('length:', length)
+    print('branches:', branches)
+    print('parties:', parties)
+    print('circuit:', circuit)
+    print('runner:', runner)
 
     '''
     prog = split([
@@ -452,9 +469,10 @@ if __name__ == '__main__':
         Input(0), #0
         Input(0), #1
         Input(0), #2
-    ]
-
-    prog += [Input(1)]*branches
+        Input(1), #4
+        Input(1), #5
+        Input(1), #6
+    ] + [Input(1)] * branches
 
     sel = list(range(3, 3+branches))
     prog.append(random_disj(sel, wires=list(range(len(prog))), start=len(prog), length=length))

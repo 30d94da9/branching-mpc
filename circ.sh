@@ -1,6 +1,6 @@
 #!/bin/bash
 
-python3 circuit.py MP-SPDZ/Programs/Source/bmpc.mpc mpc/runner.go $1 $2 $3
+python3 circuit.py MP-SPDZ/Programs/Source/bmpc.mpc mpc/runner.go
 
 cd mpc && go build && cd ..
 
